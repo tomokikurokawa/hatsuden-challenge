@@ -233,6 +233,7 @@ const Sound = {
     this.noiseBuf = this.ac.createBuffer(1, len, this.ac.sampleRate);
     const d = this.noiseBuf.getChannelData(0);
     for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+    this.initBgmFx();
     this.startBgm();
   },
   setMuted(m) {
@@ -278,10 +279,71 @@ const Sound = {
   },
   ping() { this.tone(1760, 0.18, 'triangle', 0.09); },   // 街灯が点いた
   crowd(dur = 1.1, vol = 0.13) { this.noise(dur, vol, 1700, 0.7); },   // 歓声
-  /* ---------- BGM（合成・漕ぐほど速く賑やかになる） ---------- */
-  CHORDS: [[0, 4, 7], [7, 11, 14], [9, 12, 16], [5, 9, 12]],   // C - G - Am - F
-  ARP: [0, 1, 2, 1, 0, 2, 1, 2],
+  /* ---------- BGM（木のぬくもり系・テンポは一定） ---------- */
+  BPM: 92,
+  // Cadd9 → Am7 → Fmaj7 → G6（中央Cからの半音オフセット）
+  PROG: [
+    { pad: [0, 4, 7, 14], bass: -24 },
+    { pad: [-3, 0, 4, 7], bass: -15 },
+    { pad: [-7, -3, 0, 4], bass: -19 },
+    { pad: [-5, -1, 2, 4], bass: -17 },
+  ],
+  PLUCK: [0, -1, 2, 1, -1, 3, 2, -1],   // -1 は休符
   mtof(m) { return 440 * Math.pow(2, (m - 69) / 12); },
+  initBgmFx() {
+    // ほんのり残響（マリンバ用のディレイ）
+    this.delay = this.ac.createDelay(0.6);
+    this.delay.delayTime.value = 0.29;
+    const fb = this.ac.createGain(); fb.gain.value = 0.24;
+    const wet = this.ac.createGain(); wet.gain.value = 0.2;
+    this.delay.connect(fb); fb.connect(this.delay);
+    this.delay.connect(wet); wet.connect(this.bgmBus);
+    // 全体の角を落とすローパス
+    this.warm = this.ac.createBiquadFilter();
+    this.warm.type = 'lowpass'; this.warm.frequency.value = 2600; this.warm.Q.value = 0.4;
+    this.warm.connect(this.bgmBus);
+  },
+  marimba(freq, t, vol) {
+    const o = this.ac.createOscillator(), o2 = this.ac.createOscillator();
+    const g = this.ac.createGain(), g2 = this.ac.createGain();
+    o.type = 'sine'; o.frequency.value = freq;
+    o2.type = 'sine'; o2.frequency.value = freq * 4.02;   // 木琴らしい倍音
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(vol, t + 0.008);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.75);
+    g2.gain.setValueAtTime(0.0001, t);
+    g2.gain.exponentialRampToValueAtTime(vol * 0.16, t + 0.005);
+    g2.gain.exponentialRampToValueAtTime(0.0001, t + 0.12);
+    o.connect(g); o2.connect(g2);
+    g.connect(this.warm); g2.connect(this.warm); g.connect(this.delay);
+    o.start(t); o.stop(t + 0.8);
+    o2.start(t); o2.stop(t + 0.16);
+  },
+  pad(freqs, t, dur) {
+    const lp = this.ac.createBiquadFilter();
+    lp.type = 'lowpass'; lp.frequency.value = 760; lp.Q.value = 0.3;
+    const g = this.ac.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.linearRampToValueAtTime(0.05, t + 0.8);
+    g.gain.setValueAtTime(0.05, t + Math.max(0.9, dur - 0.8));
+    g.gain.linearRampToValueAtTime(0.0001, t + dur);
+    lp.connect(g); g.connect(this.bgmBus);
+    freqs.forEach((f, i) => {
+      const o = this.ac.createOscillator();
+      o.type = 'triangle';
+      o.frequency.value = f * (1 + (i % 2 ? 0.0016 : -0.0016));   // わずかにデチューン
+      o.connect(lp); o.start(t); o.stop(t + dur + 0.06);
+    });
+  },
+  bassNote(freq, t, vol) {
+    const o = this.ac.createOscillator(), g = this.ac.createGain();
+    o.type = 'sine'; o.frequency.value = freq;
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(vol, t + 0.03);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 1.1);
+    o.connect(g); g.connect(this.bgmBus);
+    o.start(t); o.stop(t + 1.2);
+  },
   startBgm() {
     if (this.bgmOn || !this.ac) return;
     this.bgmOn = true;
@@ -290,42 +352,33 @@ const Sound = {
   },
   bgmTarget() {
     const st = (typeof G !== 'undefined') ? G.state : 'title';
-    if (st === 'play') return 0.55;
-    if (st === 'goal') return 0.5;
-    if (st === 'count') return 0.42;
-    if (st === 'result') return 0.22;
-    return 0.3;
+    if (st === 'play') return 0.8;
+    if (st === 'goal') return 0.75;
+    if (st === 'count') return 0.65;
+    if (st === 'result') return 0.4;
+    return 0.55;
   },
   schedule() {
     if (!this.ac || this.ac.state === 'suspended') return;
-    this.bgmBus.gain.setTargetAtTime(this.bgmTarget(), this.ac.currentTime, 0.4);
-    const w = (typeof Input !== 'undefined') ? Input.watts() : 0;
-    const bpm = 96 + Math.min(62, w * 0.45);
-    const stepDur = 60 / bpm / 2;
+    this.bgmBus.gain.setTargetAtTime(this.bgmTarget(), this.ac.currentTime, 0.6);
+    const stepDur = 60 / this.BPM / 2;
     let guard = 0;
-    while (this.nextTime < this.ac.currentTime + 0.25 && guard++ < 32) {
-      this.bgmStep(this.step++, this.nextTime, stepDur, w);
+    while (this.nextTime < this.ac.currentTime + 0.35 && guard++ < 32) {
+      this.bgmStep(this.step++, this.nextTime, stepDur);
       this.nextTime += stepDur;
     }
     if (this.nextTime < this.ac.currentTime) this.nextTime = this.ac.currentTime + 0.05;
   },
-  bgmNote(freq, dur, type, vol, t) {
-    const o = this.ac.createOscillator(), g = this.ac.createGain();
-    o.type = type; o.frequency.value = freq;
-    g.gain.setValueAtTime(0.0001, t);
-    g.gain.exponentialRampToValueAtTime(vol, t + 0.015);
-    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
-    o.connect(g); g.connect(this.bgmBus);
-    o.start(t); o.stop(t + dur + 0.02);
-  },
-  bgmStep(i, t, dur, w) {
-    const inten = Math.min(1, w / 110);
-    const ch = this.CHORDS[Math.floor(i / 8) % 4];
+  bgmStep(i, t, dur) {
+    const ch = this.PROG[Math.floor(i / 8) % 4];
     const s = i % 8;
-    if (s % 2 === 0) this.bgmNote(this.mtof(36 + ch[0]), dur * 1.7, 'triangle', 0.16, t);
-    const n = 60 + ch[this.ARP[s]];
-    this.bgmNote(this.mtof(n), dur * 0.85, 'square', 0.03 + 0.05 * inten, t);
-    if (inten > 0.65 && s % 4 === 2) this.bgmNote(this.mtof(n + 12), dur * 0.6, 'triangle', 0.04, t);
+    if (s === 0) {
+      this.pad(ch.pad.map(n => this.mtof(60 + n)), t, dur * 8);
+      this.bassNote(this.mtof(60 + ch.bass), t, 0.13);
+    }
+    if (s === 4) this.bassNote(this.mtof(60 + ch.bass + 12), t, 0.07);
+    const p = this.PLUCK[s];
+    if (p >= 0) this.marimba(this.mtof(72 + ch.pad[p]), t, 0.075);
   }
 };
 
