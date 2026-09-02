@@ -1,0 +1,1072 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>はつでんチャレンジ</title>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=M+PLUS+Rounded+1c:wght@800;900&display=swap">
+<style>
+  :root { --forest: #2E5427; --amber: #DE9A1F; }
+  * { box-sizing: border-box; margin: 0; }
+  body {
+    background: #16240F; color: #fff; overflow: hidden; height: 100vh;
+    display: flex; flex-direction: column;
+    font-family: "M PLUS Rounded 1c", "Yu Gothic UI", "Yu Gothic", "Meiryo", sans-serif;
+  }
+  #topbar {
+    display: flex; align-items: center; gap: 10px; padding: 6px 14px;
+    background: var(--forest); flex-wrap: wrap;
+  }
+  #topbar .title { font-weight: bold; font-size: 14px; margin-right: auto; }
+  button {
+    font-family: inherit; font-size: 13px; font-weight: bold; border: none;
+    border-radius: 8px; padding: 7px 13px; cursor: pointer;
+    background: var(--amber); color: #fff;
+  }
+  button.ghost { background: rgba(255,255,255,.15); }
+  #status { display: flex; align-items: center; gap: 6px; font-size: 12px; }
+  #statusDot { width: 10px; height: 10px; border-radius: 50%; background: #c0392b; }
+  #statusDot.on { background: #7CFC00; }
+  #statusDot.retry { background: var(--amber); }
+  #liveRpm { font-variant-numeric: tabular-nums; min-width: 120px; font-size: 12px; }
+  #stage { flex: 1; display: flex; align-items: center; justify-content: center; min-height: 0; }
+  canvas { border-radius: 6px; max-width: 100%; max-height: 100%; }
+  #debug {
+    position: fixed; right: 10px; top: 50px; width: 330px; z-index: 30;
+    background: rgba(20,25,15,.92); color: #cde8b5; border-radius: 10px;
+    font-size: 12px; padding: 12px 14px; display: none; font-family: Consolas, monospace;
+  }
+  #debug.show { display: block; }
+  #debug table { width: 100%; border-collapse: collapse; }
+  #debug td { padding: 1px 4px; font-variant-numeric: tabular-nums; }
+  #debug td:first-child { color: #8fae76; }
+  #debug .simrow { display: flex; align-items: center; gap: 8px; margin-top: 10px; font-family: inherit; }
+  #debug input[type=range] { flex: 1; }
+  #debug #dlog {
+    margin-top: 8px; height: 100px; overflow-y: auto; background: rgba(0,0,0,.4);
+    padding: 4px 6px; border-radius: 6px; white-space: pre; font-size: 11px;
+  }
+</style>
+</head>
+<body>
+
+<div id="topbar">
+  <span class="title">はつでんチャレンジ（デモ）</span>
+  <span id="status"><span id="statusDot"></span><span id="statusText">センサー未接続</span></span>
+  <span id="liveRpm">0 rpm / 0 W</span>
+  <button id="btnConnect">センサー接続</button>
+  <button id="btnDebug" class="ghost">デバッグ</button>
+  <button id="btnMute" class="ghost">音 ON</button>
+  <button id="btnReset" class="ghost" onclick="G.reset()">タイトルに戻る</button>
+</div>
+
+<div id="stage"><canvas id="cv" width="1280" height="720"></canvas></div>
+
+<div id="debug">
+  <table>
+    <tr><td>接続</td><td id="dConn">-</td></tr>
+    <tr><td>モード</td><td id="dMode">-</td></tr>
+    <tr><td>累積回転数</td><td id="dRevs">-</td></tr>
+    <tr><td>通知間隔</td><td id="dInterval">-</td></tr>
+    <tr><td>センサーRPM</td><td id="dRpm">-</td></tr>
+    <tr><td>表示RPM(平滑)</td><td id="dSmooth">-</td></tr>
+    <tr><td>換算W</td><td id="dWatts">-</td></tr>
+  </table>
+  <div class="simrow">
+    <span>シミュレータ</span>
+    <input type="range" id="simSlider" min="0" max="130" value="0">
+    <span id="simVal">0</span>
+  </div>
+  <div style="margin-top:4px;color:#8fae76">スライダーで疑似走行（開発テスト用）</div>
+  <div id="dlog"></div>
+</div>
+
+<script>
+'use strict';
+/* ================= センサー (BLE CSC) ================= */
+const Sensor = {
+  device: null, connected: false, reconnecting: false,
+  prevRevs: null, prevTime: null, lastNotifyAt: 0, lastChangeAt: 0,
+  rpm: 0, notifyInterval: 0, revs: 0,
+  log(m) {
+    const el = document.getElementById('dlog');
+    const t = new Date().toLocaleTimeString('ja-JP', { hour12: false });
+    el.textContent = `[${t}] ${m}\n` + el.textContent.split('\n').slice(0, 60).join('\n');
+  },
+  async connect() {
+    let device;
+    try {
+      device = await navigator.bluetooth.requestDevice({ filters: [{ services: ['cycling_speed_and_cadence'] }] });
+    } catch (e) {
+      try {
+        device = await navigator.bluetooth.requestDevice({ acceptAllDevices: true, optionalServices: ['cycling_speed_and_cadence'] });
+      } catch (e2) { this.log('接続キャンセル'); return; }
+    }
+    this.device = device;
+    device.addEventListener('gattserverdisconnected', () => this.onDisconnect());
+    await this.open();
+  },
+  async open() {
+    try {
+      setStatus('retry', '接続中…');
+      const server = await this.device.gatt.connect();
+      const service = await server.getPrimaryService('cycling_speed_and_cadence');
+      const ch = await service.getCharacteristic('csc_measurement');
+      await ch.startNotifications();
+      ch.addEventListener('characteristicvaluechanged', e => this.onData(e));
+      this.connected = true; this.reconnecting = false;
+      this.prevRevs = null; this.prevTime = null;
+      setStatus('on', '接続中: ' + (this.device.name || '(無名)'));
+      this.log('接続成功: ' + (this.device.name || '(無名)'));
+    } catch (e) {
+      this.log('接続失敗: ' + e.message);
+      setStatus('off', '接続失敗'); this.connected = false;
+    }
+  },
+  onDisconnect() { this.connected = false; this.log('切断→再接続試行'); this.tryReconnect(); },
+  async tryReconnect() {
+    if (this.reconnecting || !this.device) return;
+    this.reconnecting = true;
+    let wait = 1000;
+    // 無人運用のため上限なしで再接続を試み続ける（間隔は最大10秒で頭打ち）
+    while (!this.connected) {
+      setStatus('retry', `再接続中… (${Math.round(wait / 1000)}秒ごと)`);
+      try { await this.open(); } catch (e) {}
+      if (this.connected) break;
+      await new Promise(r => setTimeout(r, wait));
+      wait = Math.min(10000, wait + 1000);
+    }
+    this.reconnecting = false;
+  },
+  onData(e) {
+    const dv = e.target.value;
+    const flags = dv.getUint8(0);
+    let off = 1, revs = null, time = null, isWheel = false;
+    if (flags & 0x01) {           // 車輪回転データ（スピードモード）
+      const wRevs = dv.getUint32(off, true);
+      const wTime = dv.getUint16(off + 4, true);
+      off += 6;
+      if (!(flags & 0x02)) { revs = wRevs; time = wTime; isWheel = true; }
+    }
+    if (flags & 0x02) {           // クランク回転データ（ケイデンスモード・優先）
+      revs = dv.getUint16(off, true);
+      time = dv.getUint16(off + 2, true);
+    }
+    if (revs === null) return;
+    this.wheelMode = isWheel;
+    const now = performance.now();
+    if (this.lastNotifyAt) this.notifyInterval = now - this.lastNotifyAt;
+    this.lastNotifyAt = now; this.revs = revs;
+    if (this.prevRevs !== null && this.prevIsWheel === isWheel) {
+      const wrap = isWheel ? 4294967296 : 65536;
+      const dR = (revs - this.prevRevs + wrap) % wrap;
+      const dT = ((time - this.prevTime + 65536) % 65536) / 1024;
+      if (dR > 0 && dT > 0) {
+        let rpm = dR / dT * 60;
+        if (isWheel) rpm *= 0.35;   // 車輪回転→ケイデンス相当の仮換算
+        this.rpm = Math.min(200, rpm);
+        this.lastChangeAt = now;
+      }
+    }
+    this.prevRevs = revs; this.prevTime = time; this.prevIsWheel = isWheel;
+  },
+  currentRpm() {
+    if (!this.connected) return 0;
+    if (performance.now() - this.lastChangeAt > 2000) return 0;
+    return this.rpm;
+  }
+};
+function setStatus(kind, text) {
+  document.getElementById('statusDot').className = kind === 'on' ? 'on' : (kind === 'retry' ? 'retry' : '');
+  document.getElementById('statusText').textContent = text;
+}
+
+/* ================= 入力統合 ================= */
+const Input = {
+  simSlider: 0, smooth: 0,
+  update(dt) {
+    const target = Math.max(Sensor.currentRpm(), this.simSlider);
+    this.smooth += (target - this.smooth) * Math.min(1, dt * 5);
+    if (this.smooth < 0.5) this.smooth = 0;
+  },
+  rpm() { return this.smooth; },
+  watts() { return this.smooth * 1.2; }
+};
+window.addEventListener('keydown', e => {
+  if (e.code === 'Space' || e.code === 'Enter') {
+    e.preventDefault(); Sound.init();
+    if (G.state === 'title') G.start();
+  }
+  if (e.key === 'd' || e.key === 'D') document.getElementById('debug').classList.toggle('show');
+});
+document.getElementById('simSlider').addEventListener('input', e => {
+  Input.simSlider = Number(e.target.value);
+  document.getElementById('simVal').textContent = e.target.value;
+});
+document.getElementById('btnConnect').addEventListener('click', () => {
+  if (!navigator.bluetooth) { alert('Web Bluetooth非対応です。Chromeで開いてください。'); return; }
+  Sensor.connect();
+});
+document.getElementById('btnDebug').addEventListener('click', () =>
+  document.getElementById('debug').classList.toggle('show'));
+document.getElementById('btnMute').addEventListener('click', () => {
+  Sound.init();
+  Sound.setMuted(!Sound.muted);
+  document.getElementById('btnMute').textContent = Sound.muted ? '音 OFF' : '音 ON';
+});
+
+/* ================= サウンド (WebAudio合成) ================= */
+const Sound = {
+  ac: null, master: null, sfxBus: null, bgmBus: null, noiseBuf: null,
+  muted: false, bgmOn: false, step: 0, nextTime: 0,
+  init() {
+    if (this.ac) { if (this.ac.state === 'suspended') this.ac.resume(); return; }
+    try { this.ac = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { return; }
+    this.master = this.ac.createGain();
+    this.master.gain.value = this.muted ? 0 : 0.9;
+    this.master.connect(this.ac.destination);
+    this.sfxBus = this.ac.createGain(); this.sfxBus.gain.value = 1; this.sfxBus.connect(this.master);
+    this.bgmBus = this.ac.createGain(); this.bgmBus.gain.value = 0; this.bgmBus.connect(this.master);
+    // 歓声・拍手用のホワイトノイズ（使い回す）
+    const len = Math.floor(this.ac.sampleRate * 1.5);
+    this.noiseBuf = this.ac.createBuffer(1, len, this.ac.sampleRate);
+    const d = this.noiseBuf.getChannelData(0);
+    for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+    this.startBgm();
+  },
+  setMuted(m) {
+    this.muted = m;
+    if (this.master) this.master.gain.setTargetAtTime(m ? 0 : 0.9, this.ac.currentTime, 0.05);
+  },
+  /* ---------- 効果音 ---------- */
+  tone(freq, dur, type = 'square', vol = 0.12, when = 0) {
+    if (!this.ac) return;
+    const t = this.ac.currentTime + when;
+    const o = this.ac.createOscillator(), g = this.ac.createGain();
+    o.type = type; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+    o.connect(g); g.connect(this.sfxBus);
+    o.start(t); o.stop(t + dur);
+  },
+  noise(dur, vol, freq, q) {
+    if (!this.ac || !this.noiseBuf) return;
+    const t = this.ac.currentTime;
+    const s = this.ac.createBufferSource(); s.buffer = this.noiseBuf;
+    const bp = this.ac.createBiquadFilter();
+    bp.type = 'bandpass'; bp.frequency.value = freq; bp.Q.value = q;
+    const g = this.ac.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(vol, t + 0.12);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    s.connect(bp); bp.connect(g); g.connect(this.sfxBus);
+    s.start(t); s.stop(t + dur);
+  },
+  count() { this.tone(660, 0.12); },
+  go() { this.tone(880, 0.3, 'square', 0.15); },
+  goal() {
+    [784, 988, 1175, 1568].forEach((f, i) => this.tone(f, 0.28, 'square', 0.13, i * 0.08));
+    this.crowd(1.4, 0.15);
+  },
+  tick() { this.tone(1200, 0.05, 'square', 0.06); },
+  fanfare() {
+    [523, 659, 784, 1047].forEach((f, i) => this.tone(f, 0.35, 'triangle', 0.14, i * 0.13));
+  },
+  chime() {   // ステージ切替
+    [1047, 1319, 1568].forEach((f, i) => this.tone(f, 0.5, 'triangle', 0.1, i * 0.07));
+  },
+  ping() { this.tone(1760, 0.18, 'triangle', 0.09); },   // 街灯が点いた
+  crowd(dur = 1.1, vol = 0.13) { this.noise(dur, vol, 1700, 0.7); },   // 歓声
+  /* ---------- BGM（合成・漕ぐほど速く賑やかになる） ---------- */
+  CHORDS: [[0, 4, 7], [7, 11, 14], [9, 12, 16], [5, 9, 12]],   // C - G - Am - F
+  ARP: [0, 1, 2, 1, 0, 2, 1, 2],
+  mtof(m) { return 440 * Math.pow(2, (m - 69) / 12); },
+  startBgm() {
+    if (this.bgmOn || !this.ac) return;
+    this.bgmOn = true;
+    this.nextTime = this.ac.currentTime + 0.1;
+    setInterval(() => this.schedule(), 25);
+  },
+  bgmTarget() {
+    const st = (typeof G !== 'undefined') ? G.state : 'title';
+    if (st === 'play') return 0.55;
+    if (st === 'goal') return 0.5;
+    if (st === 'count') return 0.42;
+    if (st === 'result') return 0.22;
+    return 0.3;
+  },
+  schedule() {
+    if (!this.ac || this.ac.state === 'suspended') return;
+    this.bgmBus.gain.setTargetAtTime(this.bgmTarget(), this.ac.currentTime, 0.4);
+    const w = (typeof Input !== 'undefined') ? Input.watts() : 0;
+    const bpm = 96 + Math.min(62, w * 0.45);
+    const stepDur = 60 / bpm / 2;
+    let guard = 0;
+    while (this.nextTime < this.ac.currentTime + 0.25 && guard++ < 32) {
+      this.bgmStep(this.step++, this.nextTime, stepDur, w);
+      this.nextTime += stepDur;
+    }
+    if (this.nextTime < this.ac.currentTime) this.nextTime = this.ac.currentTime + 0.05;
+  },
+  bgmNote(freq, dur, type, vol, t) {
+    const o = this.ac.createOscillator(), g = this.ac.createGain();
+    o.type = type; o.frequency.value = freq;
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(vol, t + 0.015);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g); g.connect(this.bgmBus);
+    o.start(t); o.stop(t + dur + 0.02);
+  },
+  bgmStep(i, t, dur, w) {
+    const inten = Math.min(1, w / 110);
+    const ch = this.CHORDS[Math.floor(i / 8) % 4];
+    const s = i % 8;
+    if (s % 2 === 0) this.bgmNote(this.mtof(36 + ch[0]), dur * 1.7, 'triangle', 0.16, t);
+    const n = 60 + ch[this.ARP[s]];
+    this.bgmNote(this.mtof(n), dur * 0.85, 'square', 0.03 + 0.05 * inten, t);
+    if (inten > 0.65 && s % 4 === 2) this.bgmNote(this.mtof(n + 12), dur * 0.6, 'triangle', 0.04, t);
+  }
+};
+
+/* ================= アセット読み込み（緑抜き） ================= */
+const Assets = { bg: null, stages: [], fans: [], rider: [], sprintFrames: [], cheer: null, victory: null, readyPose: null, wave: null, tired: null, logo: null, ready: false };
+function chromaKey(img) {
+  const c = document.createElement('canvas');
+  c.width = img.width; c.height = img.height;
+  const x = c.getContext('2d');
+  x.drawImage(img, 0, 0);
+  const d = x.getImageData(0, 0, c.width, c.height);
+  const p = d.data;
+  // 四隅から抜き色を判定（緑 or マゼンタ）
+  const corner = [0, (c.width - 1) * 4, (c.height - 1) * c.width * 4, (c.width * c.height - 1) * 4];
+  let cr = 0, cg = 0, cb = 0;
+  corner.forEach(i => { cr += p[i]; cg += p[i + 1]; cb += p[i + 2]; });
+  cr /= 4; cg /= 4; cb /= 4;
+  const isMagenta = cr > 150 && cb > 150 && cg < 130;
+  for (let i = 0; i < p.length; i += 4) {
+    const r = p[i], g = p[i + 1], b = p[i + 2];
+    const k = isMagenta ? Math.min(r, b) - g : g - Math.max(r, b);
+    if (k > 70) p[i + 3] = 0;
+    else if (k > 25) {
+      p[i + 3] = Math.round(255 * (1 - (k - 25) / 45));
+      if (isMagenta) { p[i] = Math.min(r, g + 40); p[i + 2] = Math.min(b, g + 40); }
+      else p[i + 1] = Math.max(r, b);   // 縁の色かぶりを除去
+    }
+  }
+  x.putImageData(d, 0, 0);
+  return c;
+}
+function loadImg(src) {
+  return new Promise(res => {
+    const im = new Image();
+    im.onload = () => res(im);
+    im.onerror = () => res(null);
+    im.src = src;
+  });
+}
+async function loadAssets() {
+  const [st1, st2, st3, fan1, fan2, fan3,
+         r1, r2, sprint, sprint2, cheer, victory, readyPose, wave, tired, logoImg] = await Promise.all([
+    loadImg('./assets/stage1.jpg'),
+    loadImg('./assets/stage2.jpg'),
+    loadImg('./assets/stage3.jpg'),
+    loadImg('./assets/wood/fan1.png'),
+    loadImg('./assets/wood/fan2.png'),
+    loadImg('./assets/wood/fan3.png'),
+    loadImg('./assets/wood/ride1.png'),
+    loadImg('./assets/wood/ride2.png'),
+    loadImg('./assets/wood/sprint.png'),
+    loadImg('./assets/wood/sprint2.png'),
+    loadImg('./assets/wood/cheer.png'),
+    loadImg('./assets/wood/victory.png'),
+    loadImg('./assets/wood/ready.png'),
+    loadImg('./assets/wood/wave.png'),
+    loadImg('./assets/wood/tired.png'),
+    loadImg('./assets/logo3.png'),
+  ]);
+  [st1, st2, st3].forEach(s => { if (s) Assets.stages.push(s); });
+  [fan1, fan2, fan3].forEach(f => { if (f) Assets.fans.push(chromaKey(f)); });
+  if (r1) Assets.rider.push(chromaKey(r1));
+  if (r2) Assets.rider.push(chromaKey(r2));
+  if (sprint) Assets.sprintFrames.push(chromaKey(sprint));
+  if (sprint2) Assets.sprintFrames.push(chromaKey(sprint2));
+  if (cheer) Assets.cheer = chromaKey(cheer);
+  if (victory) Assets.victory = chromaKey(victory);
+  if (readyPose) Assets.readyPose = chromaKey(readyPose);
+  if (wave) Assets.wave = chromaKey(wave);
+  if (tired) Assets.tired = chromaKey(tired);
+  const bestLogo = logoImg;
+  if (bestLogo) Assets.logo = chromaKey(bestLogo);
+  Assets.ready = true;
+}
+loadAssets();
+
+/* ================= 描画ヘルパー ================= */
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+const W = cv.width, H = cv.height;
+function fitCanvas() {
+  const st = document.getElementById('stage');
+  const s = Math.min(st.clientWidth / W, st.clientHeight / H);
+  cv.style.width = (W * s) + 'px'; cv.style.height = (H * s) + 'px';
+}
+window.addEventListener('resize', fitCanvas);
+
+function rr(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+function woodPanel(x, y, w, h) {
+  ctx.save();
+  ctx.shadowColor = 'rgba(0,0,0,.35)'; ctx.shadowBlur = 10; ctx.shadowOffsetY = 4;
+  rr(x, y, w, h, 14); ctx.fillStyle = '#7C5230'; ctx.fill();
+  ctx.restore();
+  rr(x + 4, y + 4, w - 8, h - 8, 10); ctx.fillStyle = '#C89B6D'; ctx.fill();
+  // 木目
+  ctx.strokeStyle = 'rgba(124,82,48,.35)'; ctx.lineWidth = 2;
+  for (let i = 1; i < 4; i++) {
+    ctx.beginPath(); ctx.moveTo(x + 10, y + (h / 4) * i); ctx.lineTo(x + w - 10, y + (h / 4) * i - 3); ctx.stroke();
+  }
+}
+function label(text, x, y, size, color, align = 'left', bold = true, stroke = null) {
+  ctx.font = (bold ? '900 ' : '') + size + 'px "M PLUS Rounded 1c","Yu Gothic UI",sans-serif';
+  ctx.textAlign = align; ctx.textBaseline = 'middle';
+  if (stroke) { ctx.lineWidth = size / 7; ctx.strokeStyle = stroke; ctx.strokeText(text, x, y); }
+  ctx.fillStyle = color; ctx.fillText(text, x, y);
+}
+// ポップ文字（黄色グラデ＋こげ茶太フチ）
+function popText(text, x, y, size, align = 'center') {
+  ctx.font = '900 ' + size + 'px "M PLUS Rounded 1c","Yu Gothic UI",sans-serif';
+  ctx.textAlign = align; ctx.textBaseline = 'middle';
+  ctx.lineJoin = 'round';
+  ctx.lineWidth = size / 4.5;
+  ctx.strokeStyle = '#5A3413';
+  ctx.strokeText(text, x, y);
+  const g = ctx.createLinearGradient(0, y - size / 2, 0, y + size / 2);
+  g.addColorStop(0, '#FFE45C'); g.addColorStop(0.55, '#FFC81E'); g.addColorStop(1, '#F09A00');
+  ctx.fillStyle = g;
+  ctx.fillText(text, x, y);
+}
+// 風車（羽根が回る）
+function windmill(x, baseY, s, angle) {
+  ctx.save();
+  ctx.translate(x, baseY); ctx.scale(s, s);
+  ctx.fillStyle = '#EFF4F7';
+  ctx.beginPath();
+  ctx.moveTo(-7, 0); ctx.lineTo(7, 0); ctx.lineTo(3, -152); ctx.lineTo(-3, -152);
+  ctx.closePath(); ctx.fill();
+  ctx.translate(0, -152);
+  ctx.fillStyle = '#FBFDFE';
+  for (let i = 0; i < 3; i++) {
+    ctx.save();
+    ctx.rotate(angle + i * 2 * Math.PI / 3);
+    ctx.beginPath();
+    ctx.moveTo(0, 0);
+    ctx.quadraticCurveTo(11, -34, 5, -74);
+    ctx.quadraticCurveTo(0, -80, -5, -74);
+    ctx.quadraticCurveTo(-9, -34, 0, 0);
+    ctx.fill();
+    ctx.restore();
+  }
+  ctx.fillStyle = '#C3D2DA';
+  ctx.beginPath(); ctx.arc(0, 0, 7, 0, 7); ctx.fill();
+  ctx.restore();
+}
+// 街灯（発電量に応じて点灯）
+function streetLamp(x, baseY, lit) {
+  ctx.save();
+  ctx.translate(x, baseY);
+  ctx.fillStyle = '#6E5B45';
+  ctx.fillRect(-4, -104, 8, 104);
+  ctx.fillRect(-11, -4, 22, 6);
+  if (lit) {
+    const g = ctx.createRadialGradient(0, -116, 2, 0, -116, 46);
+    g.addColorStop(0, 'rgba(255,228,120,.95)');
+    g.addColorStop(0.45, 'rgba(255,210,90,.35)');
+    g.addColorStop(1, 'rgba(255,210,90,0)');
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(0, -116, 46, 0, 7); ctx.fill();
+  }
+  ctx.fillStyle = lit ? '#FFE066' : '#9AA79B';
+  ctx.beginPath();
+  ctx.moveTo(-13, -108); ctx.lineTo(13, -108); ctx.lineTo(8, -128); ctx.lineTo(-8, -128);
+  ctx.closePath(); ctx.fill();
+  ctx.fillStyle = '#5F5142';
+  ctx.fillRect(-10, -132, 20, 5);
+  ctx.restore();
+}
+// メダル
+function medal(cx, cy, r, kind) {
+  const cols = {
+    gold:   ['#FFF0A8', '#FFC93C', '#C98A0E'],
+    silver: ['#F4F7FA', '#C9D3DB', '#8C99A5'],
+    bronze: ['#F5D3A8', '#D2914F', '#95602A'],
+    ribbon: ['#FFD9D9', '#F09A9A', '#B85C5C'],
+  }[kind] || ['#FFF0A8', '#FFC93C', '#C98A0E'];
+  ctx.save();
+  // リボン（上が細く、メダルに向かって広がる）
+  const top = cy - r * 1.95, bot = cy - r * 0.32;
+  ctx.fillStyle = '#C0563B';
+  ctx.beginPath();
+  ctx.moveTo(cx - r * 0.18, top); ctx.lineTo(cx, top);
+  ctx.lineTo(cx, bot); ctx.lineTo(cx - r * 0.76, bot);
+  ctx.closePath(); ctx.fill();
+  ctx.fillStyle = '#9E4430';
+  ctx.beginPath();
+  ctx.moveTo(cx, top); ctx.lineTo(cx + r * 0.18, top);
+  ctx.lineTo(cx + r * 0.76, bot); ctx.lineTo(cx, bot);
+  ctx.closePath(); ctx.fill();
+  // 本体
+  const g = ctx.createLinearGradient(cx - r, cy - r, cx + r, cy + r);
+  g.addColorStop(0, cols[0]); g.addColorStop(0.5, cols[1]); g.addColorStop(1, cols[2]);
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.arc(cx, cy, r, 0, 7); ctx.fill();
+  ctx.lineWidth = r * 0.11; ctx.strokeStyle = cols[2];
+  ctx.beginPath(); ctx.arc(cx, cy, r * 0.93, 0, 7); ctx.stroke();
+  // 星
+  ctx.fillStyle = 'rgba(255,255,255,.9)';
+  ctx.beginPath();
+  for (let i = 0; i < 10; i++) {
+    const rad = i % 2 === 0 ? r * 0.5 : r * 0.21;
+    const a = -Math.PI / 2 + i * Math.PI / 5;
+    const px = cx + Math.cos(a) * rad, py = cy + Math.sin(a) * rad;
+    i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py);
+  }
+  ctx.closePath(); ctx.fill();
+  ctx.restore();
+}
+// スコアから称号とメダルを決める
+function rankTitle(score) {
+  if (score >= 2800) return { title: 'でんきの ヒーロー', medal: 'gold' };
+  if (score >= 2000) return { title: 'はつでん マスター', medal: 'silver' };
+  if (score >= 1200) return { title: 'かみなり キッズ', medal: 'bronze' };
+  if (score >= 600)  return { title: 'げんき ライダー', medal: 'ribbon' };
+  return { title: 'はつでん みならい', medal: 'ribbon' };
+}
+function gauge(cx, cy, r, value, max) {
+  const start = Math.PI;
+  ctx.lineWidth = 24; ctx.lineCap = 'round';
+  ctx.strokeStyle = 'rgba(0,0,0,.28)';
+  ctx.beginPath(); ctx.arc(cx, cy, r, start, 2 * Math.PI); ctx.stroke();
+  const grad = ctx.createLinearGradient(cx - r, cy, cx + r, cy);
+  grad.addColorStop(0, '#57B947'); grad.addColorStop(0.55, '#F0C400'); grad.addColorStop(1, '#E74C3C');
+  const frac = Math.max(0.004, Math.min(1, value / max));
+  if (value > 100) { ctx.save(); ctx.shadowColor = '#F0C400'; ctx.shadowBlur = 18; }
+  ctx.strokeStyle = grad;
+  ctx.beginPath(); ctx.arc(cx, cy, r, start, start + frac * Math.PI); ctx.stroke();
+  if (value > 100) ctx.restore();
+  const a = start + frac * Math.PI;
+  ctx.strokeStyle = '#33302A'; ctx.lineWidth = 7; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(cx, cy);
+  ctx.lineTo(cx + Math.cos(a) * (r - 20), cy + Math.sin(a) * (r - 20)); ctx.stroke();
+  ctx.fillStyle = '#33302A'; ctx.beginPath(); ctx.arc(cx, cy, 9, 0, 7); ctx.fill();
+}
+// フォールバック自転車（素材未生成時）
+function fallbackBike(x, y, s, pedalA) {
+  ctx.save(); ctx.translate(x, y); ctx.scale(s, s);
+  ctx.strokeStyle = '#333'; ctx.lineWidth = 4;
+  ctx.beginPath(); ctx.arc(-28, 20, 18, 0, 7); ctx.stroke();
+  ctx.beginPath(); ctx.arc(28, 20, 18, 0, 7); ctx.stroke();
+  ctx.strokeStyle = '#2A6FB0'; ctx.lineWidth = 5;
+  ctx.beginPath();
+  ctx.moveTo(-28, 20); ctx.lineTo(-4, 2); ctx.lineTo(20, 2); ctx.lineTo(28, 20);
+  ctx.moveTo(-4, 2); ctx.lineTo(0, 20); ctx.moveTo(20, 2); ctx.lineTo(24, -10); ctx.stroke();
+  const px = Math.cos(pedalA) * 10, py = Math.sin(pedalA) * 10;
+  ctx.strokeStyle = '#333'; ctx.lineWidth = 4;
+  ctx.beginPath(); ctx.moveTo(-px, 20 - py); ctx.lineTo(px, 20 + py); ctx.stroke();
+  ctx.fillStyle = '#2A6FB0';
+  ctx.beginPath(); ctx.arc(-2, -26, 11, 0, 7); ctx.fill();
+  ctx.strokeStyle = '#2A6FB0'; ctx.lineWidth = 7;
+  ctx.beginPath(); ctx.moveTo(-4, -16); ctx.lineTo(-6, 0); ctx.stroke();
+  ctx.lineWidth = 5;
+  ctx.beginPath(); ctx.moveTo(-4, -12); ctx.lineTo(22, -8); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(-6, 0); ctx.lineTo(px, 20 + py); ctx.stroke();
+  ctx.restore();
+}
+
+/* ================= ゲーム本体 ================= */
+const STAGE_NAMES = ['もりの みち', 'きの まち', 'ゆうやけロード'];
+const G = {
+  state: 'title', t: 0, energy: 0, peak: 0,
+  scroll: 0, crankA: 0, bob: 0, cheerT: 0, windmillA: 0, lastStage: 0,
+  popups: [], dust: [], confetti: [],
+  milestones: null, resultScore: 0, dispScore: 0,
+  rank: 0, top: [], btns: [],
+
+  reset() {
+    this.state = 'title'; this.t = 0; this.energy = 0; this.peak = 0;
+    this.dust = []; this.confetti = []; this.lastStage = 0;
+    this.popCur = null; this.popQueue = []; this.goalT = 0; this.coastW = 0;
+    this.litLamps = 0;
+    this.milestones = { w80: false, w110: false, last10: false };
+    this.loadTop();
+  },
+  loadTop() {
+    const list = JSON.parse(localStorage.getItem('fukumoku-ranking') || '[]');
+    this.top = list.slice(0, 5);
+  },
+  start() { this.state = 'count'; this.t = 3.4; Sound.init(); },
+  spawnConfetti(n) {
+    for (let i = 0; i < n; i++) {
+      this.confetti.push({
+        x: Math.random() * W, y: -20 - Math.random() * 300,
+        vy: 120 + Math.random() * 160, vx: (Math.random() - 0.5) * 60,
+        rot: Math.random() * 7, vr: (Math.random() - 0.5) * 8,
+        col: ['#F0C400', '#E74C3C', '#5B8DBE', '#97BC62', '#fff'][i % 5],
+      });
+    }
+  },
+  drawConfetti() {
+    this.confetti.forEach(c => {
+      ctx.save(); ctx.translate(c.x, c.y); ctx.rotate(c.rot);
+      ctx.fillStyle = c.col; ctx.fillRect(-6, -3, 12, 6); ctx.restore();
+    });
+  },
+  startGoal() {
+    this.state = 'goal';
+    this.goalT = 2.6;
+    this.coastW = Math.max(35, Input.watts());
+    this.popCur = null; this.popQueue = [];
+    Sound.goal();
+    this.spawnConfetti(90);
+  },
+  // ゴール看板（上から降りてくる）
+  drawGoalBanner() {
+    const elapsed = 2.6 - this.goalT;
+    const ease = 1 - Math.pow(1 - Math.min(1, elapsed / 0.45), 3);
+    const cy = -120 + ease * 320;
+    const bw = 560, bh = 150, bx = W / 2 - bw / 2;
+    const bob = Math.sin(elapsed * 5) * 5 * Math.min(1, elapsed);
+    ctx.save();
+    ctx.translate(0, bob);
+    woodPanel(bx, cy, bw, bh);
+    // チェッカー帯
+    for (let r = 0; r < 2; r++) {
+      for (let i = 0; i < 14; i++) {
+        ctx.fillStyle = (i + r) % 2 ? '#FFFFFF' : '#2E2A24';
+        ctx.fillRect(bx + 10 + i * 40, cy + (r ? bh - 30 : 10), 40, 20);
+      }
+    }
+    popText('ゴール！', W / 2, cy + bh / 2 + 4, 66);
+    ctx.restore();
+  },
+  // 一度に1つずつ順番に表示（同時に出すと画面が文字だらけになる）
+  pop(text, color = '#F0C400', cheer = true) {
+    if (this.popCur && this.popCur.text === text) return;
+    if (this.popQueue.some(q => q.text === text)) return;
+    if (this.popQueue.length >= 3) return;
+    this.popQueue.push({ text, color, cheer });
+  },
+  updatePopups(dt) {
+    if (this.popCur) {
+      this.popCur.t -= dt;
+      this.popCur.y -= dt * 26;
+      if (this.popCur.t <= 0) this.popCur = null;
+    }
+    if (!this.popCur && this.popQueue.length) {
+      const q = this.popQueue.shift();
+      // ラスト5秒の巨大カウントダウン（y=250前後）に隠れないよう下へ退避
+      const baseY = (this.state === 'play' && this.t <= 7) ? 450 : 320;
+      this.popCur = { text: q.text, color: q.color, t: 1.5, y: baseY };
+      if (q.cheer) this.cheerT = 1.2;   // ガッツポーズ表示
+    }
+  },
+  finish() {
+    this.state = 'result';
+    this.resultScore = Math.round(this.energy);
+    this.dispScore = 0;
+    const list = JSON.parse(localStorage.getItem('fukumoku-ranking') || '[]');
+    list.push({ score: this.resultScore, at: Date.now() });
+    list.sort((a, b) => b.score - a.score);
+    localStorage.setItem('fukumoku-ranking', JSON.stringify(list.slice(0, 10)));
+    this.rank = list.findIndex(e => e.score === this.resultScore) + 1;
+    this.top = list.slice(0, 5);
+    Sound.fanfare();
+    this.spawnConfetti(120);
+    this.btns = [
+      { x: W / 2 - 240, y: 616, w: 220, h: 56, text: 'もういちど', fn: () => { this.reset(); this.start(); } },
+      { x: W / 2 + 20, y: 616, w: 220, h: 56, text: 'タイトルへ', fn: () => this.reset() },
+    ];
+  },
+
+  update(dt) {
+    const w = Input.watts();
+    // ゴール後は入力によらず惰性で減速していく
+    this.scroll += (this.state === 'goal' ? this.coastW : w) * dt * 2.2;
+    this.crankA += Input.rpm() / 60 * 2 * Math.PI * dt;
+    this.bob += dt * (3 + Input.rpm() / 18);
+    this.windmillA += (0.55 + w / 22) * dt;   // 発電量が上がるほど風車が速く回る
+    if (this.cheerT > 0) this.cheerT -= dt;
+    if (this.state === 'play') {
+      const sInfo = this.stageInfo();
+      const si = sInfo.f > 0 ? sInfo.j : sInfo.i;   // フェード開始と同時に予告する
+      if (si !== this.lastStage) {
+        this.lastStage = si;
+        this.pop('つぎは ' + (STAGE_NAMES[si] || 'あたらしい みち') + '！', '#7FD4FF', false);
+        Sound.chime();
+      }
+    }
+
+    if (this.state === 'count') {
+      const before = Math.ceil(this.t);
+      this.t -= dt;
+      const after = Math.ceil(this.t);
+      if (after < before && after > 0) Sound.count();
+      if (this.t <= 0) {
+        this.state = 'play'; this.t = 30; Sound.go();
+        this.pop('スタート！！', '#7CFC00', false);
+      }
+    } else if (this.state === 'play') {
+      const beforeSec = Math.ceil(this.t);
+      this.t -= dt;
+      this.energy += w * dt;
+      this.peak = Math.max(this.peak, w);
+      if (w >= 80 && !this.milestones.w80) { this.milestones.w80 = true; this.pop('いいぞ！ 80W こえた！'); Sound.crowd(1.0, 0.11); }
+      if (w >= 110 && !this.milestones.w110) { this.milestones.w110 = true; this.pop('パワーぜんかい！！', '#FF7B54'); Sound.crowd(1.3, 0.16); }
+      if (this.t <= 10 && !this.milestones.last10) { this.milestones.last10 = true; this.pop('ラストスパート！', '#FF5252'); }
+      if (this.t <= 5 && Math.ceil(this.t) < beforeSec) Sound.tick();
+      if (this.t <= 0) { this.t = 0; this.startGoal(); }
+    } else if (this.state === 'goal') {
+      this.goalT -= dt;
+      this.coastW = Math.max(0, this.coastW - 26 * dt);
+      if (this.goalT <= 0) this.finish();
+    } else if (this.state === 'result') {
+      this.dispScore = Math.min(this.resultScore, this.dispScore + this.resultScore * dt * 0.8 + 2);
+    }
+    // パーティクル
+    if (w > 40 && Math.random() < dt * w * 0.25) {
+      this.dust.push({ x: 340, y: 600 + Math.random() * 16, vx: -80 - w, vy: -20 - Math.random() * 40, t: 0.6 });
+    }
+    this.dust.forEach(p => { p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 150 * dt; p.t -= dt; });
+    this.dust = this.dust.filter(p => p.t > 0);
+    this.updatePopups(dt);
+    // 街灯が新しく点いたら音で知らせる（発電の手応え）
+    if (this.state === 'play') {
+      let lit = 0;
+      for (let i = 0; i < 5; i++) if (w >= 28 + i * 21) lit++;
+      if (lit > this.litLamps) Sound.ping();
+      this.litLamps = lit;
+    }
+    this.confetti.forEach(c => { c.y += c.vy * dt; c.x += c.vx * dt; c.rot += c.vr * dt; });
+    this.confetti = this.confetti.filter(c => c.y < H + 30);
+  },
+
+  // ---- ステージ（時間経過で景色が変わる） ----
+  stageInfo() {
+    const n = Assets.stages.length;
+    if (n <= 1) return { i: 0, j: 0, f: 0 };
+    if (this.state === 'title' || this.state === 'count') return { i: 0, j: 0, f: 0 };
+    const elapsed = Math.min(30, Math.max(0, 30 - this.t));
+    const per = 30 / n;
+    const i = Math.min(n - 1, Math.floor(elapsed / per));
+    const into = elapsed - i * per;
+    const FADE = 2.0;
+    if (i < n - 1 && into > per - FADE) {
+      return { i, j: i + 1, f: Math.min(1, (into - (per - FADE)) / FADE) };
+    }
+    return { i, j: i, f: 0 };
+  },
+  drawBgLayer(img, alpha) {
+    if (!img) return;
+    ctx.globalAlpha = alpha;
+    const scale = H / img.height;
+    const tw = img.width * scale;
+    const total = this.scroll * 0.55;
+    const ti = Math.floor(total / tw);
+    const off = total - ti * tw;
+    for (let k = 0; k <= 2; k++) {
+      const idx = ti + k;
+      const x = k * tw - off;
+      ctx.save();
+      if (idx % 2 === 1) { ctx.translate(x + tw, 0); ctx.scale(-1, 1); }
+      else ctx.translate(x, 0);
+      ctx.drawImage(img, 0, 0, tw, H);
+      ctx.restore();
+    }
+    ctx.globalAlpha = 1;
+  },
+  // ---- 発電連動：風車（漕ぐ速さで回る） ----
+  drawWindmills() {
+    if (!Assets.stages.length) return;   // 旧背景は風車が焼き込み済みなので描かない
+    // span = 個数 × 間隔 にしないと剰余が重なって同じ風車が二重に並ぶ
+    const off = this.scroll * 0.5;
+    const N = 3, STEP = 560, span = N * STEP;
+    for (let i = 0; i < N; i++) {
+      const x = ((i * STEP - off) % span + span) % span - 200;
+      const s = 0.72 + i * 0.16;
+      windmill(x, 500, s, this.windmillA * (1 + i * 0.13));
+    }
+  },
+  // ---- 発電連動：街灯（発電量が上がるほど灯る） ----
+  drawLamps() {
+    const w = Input.watts();
+    const off = this.scroll * 2.2;
+    const N = 5, STEP = 430, span = N * STEP;
+    for (let i = 0; i < N; i++) {
+      const x = ((i * STEP - off) % span + span) % span - 100;
+      const need = 28 + i * 21;             // 28/49/70/91/112 W
+      streetLamp(x, 556, w >= need);
+    }
+  },
+  // ---- 沿道の観客 ----
+  drawFans() {
+    if (!Assets.fans.length) return;
+    const excited = Input.watts() > 70;
+    const off = this.scroll * 2.2;
+    const N = 6, STEP = 330, span = N * STEP;
+    for (let i = 0; i < N; i++) {
+      const x = ((i * STEP + 165 - off) % span + span) % span - 150;
+      const img = Assets.fans[i % Assets.fans.length];
+      const h = 118, iw = h * img.width / img.height;
+      const jump = excited ? Math.abs(Math.sin(this.bob * 2.2 + i)) * 13 : 0;
+      const rot = excited ? Math.sin(this.bob * 4.4 + i) * 0.13 : 0;
+      ctx.save();
+      ctx.translate(x, 556 - jump);
+      ctx.rotate(rot);
+      ctx.drawImage(img, -iw / 2, -h, iw, h);
+      ctx.restore();
+    }
+  },
+  drawWorld() {
+    // 背景（ステージのクロスフェード）
+    if (Assets.stages.length) {
+      const s = this.stageInfo();
+      this.drawBgLayer(Assets.stages[s.i], 1);
+      if (s.f > 0) this.drawBgLayer(Assets.stages[s.j], s.f);
+    } else if (Assets.bg) {
+      this.drawBgLayer(Assets.bg, 1);
+    } else {
+      const sky = ctx.createLinearGradient(0, 0, 0, H);
+      sky.addColorStop(0, '#69B7E8'); sky.addColorStop(0.65, '#BFE3F5'); sky.addColorStop(0.66, '#7CB65B'); sky.addColorStop(1, '#5E9C44');
+      ctx.fillStyle = sky; ctx.fillRect(0, 0, W, H);
+    }
+    this.drawWindmills();
+    this.drawFans();
+    this.drawLamps();
+    // 道路
+    ctx.fillStyle = 'rgba(90,58,26,.25)'; ctx.fillRect(0, 545, W, 8);
+    ctx.fillStyle = '#C89B6D'; ctx.fillRect(0, 550, W, 170);
+    ctx.fillStyle = '#B3835A';
+    for (let i = 0; i < 9; i++) {
+      const x = ((i * 160 - this.scroll * 2.2) % 1440 + 1440) % 1440 - 100;
+      ctx.fillRect(x, 622, 84, 10);
+    }
+    ctx.fillStyle = '#8FBF6E'; ctx.fillRect(0, 700, W, 20);
+    // 砂ぼこり
+    this.dust.forEach(p => {
+      ctx.globalAlpha = p.t * 1.4;
+      ctx.fillStyle = '#D9C4A5';
+      ctx.beginPath(); ctx.arc(p.x, p.y, 5 + (0.6 - p.t) * 10, 0, 7); ctx.fill();
+    });
+    ctx.globalAlpha = 1;
+    // キャラクター
+    const bobY = Math.sin(this.bob) * (2 + Input.rpm() / 30);
+    const speedLines = Input.watts() > 70;
+    if (speedLines) {
+      ctx.strokeStyle = 'rgba(255,255,255,.5)'; ctx.lineWidth = 4;
+      for (let i = 0; i < 5; i++) {
+        const y = 430 + i * 40 + (i % 2) * 12;
+        const x = 250 - ((this.scroll * 5 + i * 140) % 420);
+        ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x + 90, y); ctx.stroke();
+      }
+    }
+    if (Assets.rider.length) {
+      const frameIdx = Math.floor(this.crankA / Math.PI);
+      let frame = Assets.rider[frameIdx % Assets.rider.length] || Assets.rider[0];
+      let wobble = 0;
+      if (this.state === 'goal' && Assets.cheer) frame = Assets.cheer;
+      else if (this.state === 'count' && Input.rpm() < 15 && Assets.readyPose) frame = Assets.readyPose;
+      else if (this.state === 'play' && this.cheerT > 0 && Assets.cheer) frame = Assets.cheer;
+      else if (this.state === 'play' && Input.watts() > 105 && Assets.sprintFrames.length) {
+        frame = Assets.sprintFrames[frameIdx % Assets.sprintFrames.length];
+        // 1コマしかない間はガタガタ揺らして疾走感を出す
+        if (Assets.sprintFrames.length < 2) wobble = Math.sin(this.bob * 4) * 0.035;
+      }
+      const rh = 280, rw = rh * frame.width / frame.height;
+      const tilt = (Input.watts() > 105 ? -0.05 : 0) + wobble;
+      ctx.save();
+      ctx.translate(420, 568 + bobY); ctx.rotate(tilt);
+      ctx.drawImage(frame, -rw / 2, -140, rw, rh);
+      ctx.restore();
+    } else {
+      fallbackBike(420, 600 + bobY, 2.4, this.crankA);
+    }
+  },
+
+  drawHud() {
+    woodPanel(34, 30, 300, 218);
+    gauge(184, 186, 96, Input.watts(), 150);
+    label(Math.round(Input.watts()) + ' W', 184, 222, 36, '#33302A', 'center');
+    label('はつでんメーター', 184, 62, 18, '#5A3A1A', 'center');
+    const lastSpurt = (this.state === 'play' && this.t <= 5) || this.state === 'goal';
+    if (!lastSpurt) {
+      woodPanel(W - 250, 30, 216, 104);
+      label('のこり', W - 142, 64, 17, '#5A3A1A', 'center');
+      const remain = this.state === 'play' ? Math.max(0, this.t) : 30;
+      label(remain.toFixed(1), W - 142, 102, 42, '#33302A', 'center');
+    }
+    woodPanel(W - 330, H - 108, 296, 76);
+    label('スコア', W - 300, H - 69, 24, '#FFFFFF', 'left', true, '#5A3413');
+    popText(String(Math.round(this.energy)), W - 62, H - 69, 44, 'right');
+    // ロゴ（小）
+    if (Assets.logo) {
+      const lw = 300, lh = lw * Assets.logo.height / Assets.logo.width;
+      ctx.drawImage(Assets.logo, W / 2 - lw / 2, 16, lw, lh);
+    }
+    // ポップアップ（常に1つだけ）
+    if (this.popCur) {
+      ctx.globalAlpha = Math.min(1, this.popCur.t * 2.5);
+      label(this.popCur.text, W / 2, this.popCur.y, 46, this.popCur.color, 'center', true, '#3A2A10');
+      ctx.globalAlpha = 1;
+    }
+  },
+
+  draw() {
+    this.drawWorld();
+    if (this.state === 'title') {
+      ctx.fillStyle = 'rgba(15,25,10,.45)'; ctx.fillRect(0, 0, W, H);
+      if (Assets.logo) {
+        const lw = 760, lh = lw * Assets.logo.height / Assets.logo.width;
+        ctx.drawImage(Assets.logo, W / 2 - lw / 2, 90, lw, lh);
+      } else {
+        label('はつでんチャレンジ', W / 2, 170, 84, '#F0C400', 'center', true, '#3A2A10');
+      }
+      label('30びょうで なんワット だせるかな？', W / 2, 360, 30, '#fff', 'center', true, 'rgba(0,0,0,.4)');
+      const b = { x: W / 2 - 160, y: 420, w: 320, h: 78 };
+      const pulse = 1 + Math.sin(performance.now() / 300) * 0.03;
+      ctx.save();
+      ctx.translate(W / 2, b.y + 39); ctx.scale(pulse, pulse); ctx.translate(-W / 2, -(b.y + 39));
+      rr(b.x, b.y, b.w, b.h, 39); ctx.fillStyle = '#DE9A1F'; ctx.fill();
+      label('スタート！', W / 2, b.y + 41, 34, '#fff', 'center');
+      ctx.restore();
+      this.titleBtn = b;
+      // ランキングボード
+      woodPanel(W - 330, 200, 290, 260);
+      label('本日のトップ5', W - 185, 236, 22, '#5A3A1A', 'center');
+      if (this.top.length === 0) label('まだ きろくが ないよ', W - 185, 330, 18, '#7A6244', 'center', false);
+      this.top.forEach((e, i) => {
+        label(`${i + 1} い`, W - 290, 278 + i * 36, 20, '#8A5A20', 'left');
+        label(String(e.score), W - 90, 278 + i * 36, 22, '#33302A', 'right');
+      });
+    } else if (this.state === 'count') {
+      this.drawHud();
+      ctx.fillStyle = 'rgba(0,0,0,.35)'; ctx.fillRect(0, 0, W, H);
+      const n = Math.ceil(this.t);
+      const frac = 1 - (this.t - Math.floor(this.t));
+      const size = 150 + frac * 60;
+      label(n > 3 ? 'よーい…' : String(n), W / 2, H / 2 - 20, n > 3 ? 60 : size, '#fff', 'center', true, '#3A2A10');
+      if (Input.rpm() > 30) {
+        label('いいちょうし！ そのまま！', W / 2, H / 2 + 110, 32, '#7CFC00', 'center', true, '#1A3A10');
+      } else {
+        label('もう こぎはじめて OK！', W / 2, H / 2 + 110, 32, '#F0C400', 'center', true, '#3A2A10');
+      }
+    } else if (this.state === 'play') {
+      this.drawHud();
+      // ラスト5秒の大カウントダウン
+      if (this.t <= 5 && this.t > 0) {
+        const n = Math.ceil(this.t);
+        const frac = 1 - (this.t - Math.floor(this.t));
+        const size = 170 + frac * 70;
+        label(String(n), W / 2, 250, size, '#FFFFFF', 'center', true, '#B3261E');
+      }
+      // 序盤にまだ漕げていない子へのヒント
+      if (this.t > 24 && Input.rpm() < 10 && !this.popCur && !this.popQueue.length) {
+        const pulse = 1 + Math.sin(performance.now() / 200) * 0.06;
+        ctx.save();
+        ctx.translate(420, 330); ctx.scale(pulse, pulse);
+        label('ペダルを こごう！', 0, 0, 40, '#F0C400', 'center', true, '#3A2A10');
+        ctx.restore();
+      }
+    } else if (this.state === 'goal') {
+      this.drawHud();
+      this.drawConfetti();
+      this.drawGoalBanner();
+    } else if (this.state === 'result') {
+      ctx.fillStyle = 'rgba(15,22,8,.85)'; ctx.fillRect(0, 0, W, H);
+      this.drawConfetti();
+      label('けっか はっぴょう！', W / 2, 100, 52, '#F0C400', 'center', true, '#3A2A10');
+      const resultSprite = (this.rank <= 3 ? Assets.victory : Assets.tired) || Assets.victory;
+      if (resultSprite) {
+        const vh = 320, vw = vh * resultSprite.width / resultSprite.height;
+        const vb = Math.abs(Math.sin(performance.now() / 250)) * -22;
+        ctx.drawImage(resultSprite, 158 - vw / 2, 220 + vb, vw, vh);
+      }
+      woodPanel(W / 2 - 330, 150, 660, 240);
+      label('スコア', W / 2, 200, 26, '#FFFFFF', 'center', true, '#5A3413');
+      popText(String(Math.round(this.dispScore)), W / 2, 268, 84);
+      const chargeMin = (this.resultScore / 18 / 60).toFixed(1);
+      label(`スマホ充電 やく ${chargeMin} 分ぶん はつでんしたよ！`, W / 2, 348, 24, '#5A3A1A', 'center');
+      // 称号とメダル
+      const rt = rankTitle(this.resultScore);
+      const mb = Math.sin(performance.now() / 400) * 5;
+      medal(1096, 292 + mb, 72, rt.medal);
+      label(rt.title, 1096, 408 + mb, 25, '#FFFFFF', 'center', true, '#5A3413');
+      label(`さいだい ${Math.round(this.peak)} W　／　本日 ${this.rank} 位`, W / 2, 430, 30, '#fff', 'center', true, 'rgba(0,0,0,.4)');
+      label('― 本日のトップ5 ―', W / 2, 472, 20, '#F0C400', 'center');
+      this.top.forEach((e, i) => {
+        const isMe = e.score === this.resultScore;
+        label(`${i + 1} い　${e.score}`, W / 2, 500 + i * 22, 18, isMe ? '#F0C400' : '#fff', 'center', isMe);
+      });
+      this.btns.forEach(b => {
+        rr(b.x, b.y, b.w, b.h, 14); ctx.fillStyle = '#DE9A1F'; ctx.fill();
+        label(b.text, b.x + b.w / 2, b.y + b.h / 2 + 1, 24, '#fff', 'center');
+      });
+    }
+  }
+};
+G.reset();
+
+/* ================= 入力（タップ） ================= */
+cv.addEventListener('pointerdown', e => {
+  Sound.init();
+  const rect = cv.getBoundingClientRect();
+  const x = (e.clientX - rect.left) * W / rect.width;
+  const y = (e.clientY - rect.top) * H / rect.height;
+  if (G.state === 'title') {
+    const b = G.titleBtn;
+    if (b && x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h) { G.start(); return; }
+  } else if (G.state === 'result') {
+    for (const b of G.btns) {
+      if (x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h) { b.fn(); return; }
+    }
+  }
+});
+
+/* ================= メインループ ================= */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min(0.05, (now - lastT) / 1000);
+  lastT = now;
+  Input.update(dt);
+  G.update(dt);
+  G.draw();
+  document.getElementById('liveRpm').textContent =
+    `${Math.round(Input.rpm())} rpm / ${Math.round(Input.watts())} W`;
+  if (Sensor.connected && Sensor.lastNotifyAt) {
+    document.getElementById('statusText').textContent =
+      `接続中: ${(Sensor.device && Sensor.device.name) || '(無名)'}｜${Sensor.wheelMode ? 'スピード(仮換算・要切替)' : 'ケイデンス'}`;
+  }
+  const dbg = document.getElementById('debug');
+  if (dbg.classList.contains('show')) {
+    document.getElementById('dConn').textContent = Sensor.connected ? '接続中' : '未接続';
+    document.getElementById('dMode').textContent = !Sensor.connected ? '-' :
+      (Sensor.wheelMode ? 'スピード（仮換算・ケイデンス推奨）' : 'ケイデンス');
+    document.getElementById('dRevs').textContent = Sensor.revs;
+    document.getElementById('dInterval').textContent = Sensor.notifyInterval ? Math.round(Sensor.notifyInterval) + ' ms' : '-';
+    document.getElementById('dRpm').textContent = Sensor.currentRpm().toFixed(1);
+    document.getElementById('dSmooth').textContent = Input.rpm().toFixed(1);
+    document.getElementById('dWatts').textContent = Math.round(Input.watts());
+  }
+  requestAnimationFrame(loop);
+}
+fitCanvas();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
