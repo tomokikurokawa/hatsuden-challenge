@@ -9,7 +9,7 @@
 2. 画面右上の「センサー接続」→ ダイアログでセンサー（COOSPO BK9C など）を選ぶ
 3. 「スタート！」を押して30秒間ペダルを漕ぐ
 
-**公開URL:** https://tomokikurokawa.github.io/hatsuden-challenge/
+**公開URL:** https://hatsuden.atrum-japan.com/
 
 ## 動作条件
 
