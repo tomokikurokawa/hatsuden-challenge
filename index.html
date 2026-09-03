@@ -171,10 +171,30 @@ const Sensor = {
     }
     this.prevRevs = revs; this.prevTime = time; this.prevIsWheel = isWheel;
   },
+  // センサー信号が途切れても画面が急停止しないよう「保持 → なだらかに減速」させる。
+  // 実物の発電機のフライホイールと同じ挙動で、瞬断や電波の途切れでも画面が止まらない。
+  HOLD_MAX: 3.0,   // 値を保持する最大秒数
+  DECAY: 2.5,      // 保持のあと0になるまでの秒数
+  gapSec() { return this.lastChangeAt ? (performance.now() - this.lastChangeAt) / 1000 : 999; },
+  holdSec() {
+    // 遅く漕ぐ子ほどクランク1回転の間隔は長い（30rpmなら2秒に1回しか信号が来ない）。
+    // 固定のタイムアウトだとゆっくり漕ぐ子が「止まった」と誤判定されるため、想定間隔から決める
+    const expected = this.rpm > 0 ? 60 / this.rpm : 2;
+    return Math.min(this.HOLD_MAX, Math.max(1.5, expected * 2.5));
+  },
+  holdState() {
+    const gap = this.gapSec();
+    if (!this.lastChangeAt) return '停止';
+    if (gap <= this.holdSec()) return '保持';
+    if (gap < this.holdSec() + this.DECAY) return '減速';
+    return '停止';
+  },
   currentRpm() {
-    if (!this.connected) return 0;
-    if (performance.now() - this.lastChangeAt > 2000) return 0;
-    return this.rpm;
+    if (!this.lastChangeAt) return 0;
+    const gap = this.gapSec(), hold = this.holdSec();
+    if (gap <= hold) return this.rpm;                 // 保持
+    const k = 1 - (gap - hold) / this.DECAY;          // 減速
+    return k > 0 ? this.rpm * k : 0;
   }
 };
 function setStatus(kind, text) {
@@ -323,7 +343,9 @@ const Sound = {
   // カウントダウンの音（ペタッ）。ファイルが無ければ合成音で代替
   count() { if (!this.playSfx('peta', this.PETA_VOL)) this.tone(660, 0.12); },
   PETA_VOL: 0.9,
-  go() { this.tone(880, 0.3, 'square', 0.15); },
+  // スタートの合図（ピューンと逃げる）。ファイルが無ければ合成音で代替
+  go() { if (!this.playSfx('start', this.START_VOL)) this.tone(880, 0.3, 'square', 0.15); },
+  START_VOL: 0.9,
   goal() {
     // 歓声と拍手のmp3を同時に鳴らす
     const a = this.playSfx('cheer', this.CHEER_VOL, { track: true });
@@ -494,7 +516,7 @@ fetch('./assets/audio/bgm.mp3')
   .catch(() => {});
 // ゴール時の歓声・拍手も先読み
 [['cheer', './assets/audio/cheer.mp3'], ['applause', './assets/audio/applause.mp3'],
- ['peta', './assets/audio/peta.mp3']].forEach(([k, u]) => {
+ ['peta', './assets/audio/peta.mp3'], ['start', './assets/audio/start.mp3']].forEach(([k, u]) => {
   fetch(u).then(r => r.ok ? r.arrayBuffer() : null)
     .then(b => { if (b) { Sound.sfxData[k] = b; if (Sound.ac) Sound.loadSfxBuffers(); } })
     .catch(() => {});
@@ -1234,7 +1256,9 @@ function loop(now) {
       (Sensor.wheelMode ? 'スピード（仮換算・ケイデンス推奨）' : 'ケイデンス');
     document.getElementById('dRevs').textContent = Sensor.revs;
     document.getElementById('dInterval').textContent = Sensor.notifyInterval ? Math.round(Sensor.notifyInterval) + ' ms' : '-';
-    document.getElementById('dRpm').textContent = Sensor.currentRpm().toFixed(1);
+    document.getElementById('dRpm').textContent =
+      Sensor.currentRpm().toFixed(1) + '  [' + Sensor.holdState() +
+      ' ' + Math.min(9.9, Sensor.gapSec()).toFixed(1) + 's]';
     document.getElementById('dSmooth').textContent = Input.rpm().toFixed(1);
     document.getElementById('dWatts').textContent = Math.round(Input.watts());
   }
