@@ -281,17 +281,30 @@ const Sound = {
     }
   },
   goalSfx: [],
-  playSfx(key, vol) {
+  // opts.track: 次のプレイ開始で止める対象にする / opts.fadeStart, opts.fadeDur: 途中でフェードアウト
+  playSfx(key, vol, opts) {
+    opts = opts || {};
     const buf = this.sfxBuf[key];
     if (!this.ac || !buf) return false;
+    const t = this.ac.currentTime + 0.01;
     const s = this.ac.createBufferSource();
     s.buffer = buf;
     const g = this.ac.createGain();
-    g.gain.value = vol;
+    g.gain.setValueAtTime(vol, t);
+    let stopAt = 0;
+    if (opts.fadeStart != null && opts.fadeStart < buf.duration) {
+      const fs = t + opts.fadeStart, fe = fs + (opts.fadeDur || 1.5);
+      g.gain.setValueAtTime(vol, fs);
+      g.gain.linearRampToValueAtTime(0.0001, fe);
+      stopAt = fe + 0.05;
+    }
     s.connect(g); g.connect(this.sfxBus);
-    s.start(this.ac.currentTime + 0.01);
-    this.goalSfx.push({ s, g });
-    s.onended = () => { this.goalSfx = this.goalSfx.filter(x => x.s !== s); };
+    s.start(t);
+    if (stopAt) s.stop(stopAt);   // stop は start の後でしか呼べない
+    if (opts.track) {
+      this.goalSfx.push({ s, g });
+      s.onended = () => { this.goalSfx = this.goalSfx.filter(x => x.s !== s); };
+    }
     return true;
   },
   // 拍手は18秒あるので、次のプレイが始まったらフェードして止める
@@ -307,12 +320,15 @@ const Sound = {
     });
     this.goalSfx = [];
   },
-  count() { this.tone(660, 0.12); },
+  // カウントダウンの音（ペタッ）。ファイルが無ければ合成音で代替
+  count() { if (!this.playSfx('peta', this.PETA_VOL)) this.tone(660, 0.12); },
+  PETA_VOL: 0.9,
   go() { this.tone(880, 0.3, 'square', 0.15); },
   goal() {
     // 歓声と拍手のmp3を同時に鳴らす
-    const a = this.playSfx('cheer', this.CHEER_VOL);
-    const b = this.playSfx('applause', this.APPLAUSE_VOL);
+    const a = this.playSfx('cheer', this.CHEER_VOL, { track: true });
+    // 拍手は18.7秒あるので約5秒でフェードアウトさせる
+    const b = this.playSfx('applause', this.APPLAUSE_VOL, { track: true, fadeStart: 3.5, fadeDur: 1.5 });
     if (!a && !b) {   // ファイルが読めなかった時だけ合成音で代替
       [784, 988, 1175, 1568].forEach((f, i) => this.tone(f, 0.28, 'square', 0.13, i * 0.08));
       this.crowd(1.4, 0.15);
@@ -320,7 +336,7 @@ const Sound = {
   },
   CHEER_VOL: 0.9,
   APPLAUSE_VOL: 0.8,
-  tick() { this.tone(1200, 0.05, 'square', 0.06); },
+  tick() { if (!this.playSfx('peta', this.PETA_VOL * 0.8)) this.tone(1200, 0.05, 'square', 0.06); },
   fanfare() {
     [523, 659, 784, 1047].forEach((f, i) => this.tone(f, 0.35, 'triangle', 0.14, i * 0.13));
   },
@@ -477,7 +493,8 @@ fetch('./assets/audio/bgm.mp3')
   .then(b => { if (b) Sound.bgmData = b; })
   .catch(() => {});
 // ゴール時の歓声・拍手も先読み
-[['cheer', './assets/audio/cheer.mp3'], ['applause', './assets/audio/applause.mp3']].forEach(([k, u]) => {
+[['cheer', './assets/audio/cheer.mp3'], ['applause', './assets/audio/applause.mp3'],
+ ['peta', './assets/audio/peta.mp3']].forEach(([k, u]) => {
   fetch(u).then(r => r.ok ? r.arrayBuffer() : null)
     .then(b => { if (b) { Sound.sfxData[k] = b; if (Sound.ac) Sound.loadSfxBuffers(); } })
     .catch(() => {});
