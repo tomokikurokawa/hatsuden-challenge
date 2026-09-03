@@ -765,7 +765,11 @@ const G = {
     const list = JSON.parse(localStorage.getItem('fukumoku-ranking') || '[]');
     this.top = list.slice(0, 5);
   },
-  start() { this.state = 'count'; this.t = 3.4; Sound.init(); Sound.stopGoalSfx(); },
+  start() {
+    this.state = 'count'; this.t = 3.4;
+    Sound.init(); Sound.stopGoalSfx();
+    Sound.playBgmFrom(0);   // カウントダウン開始と同時に曲を頭から鳴らす
+  },
   spawnConfetti(n) {
     for (let i = 0; i < n; i++) {
       this.confetti.push({
@@ -874,7 +878,6 @@ const G = {
       if (after < before && after > 0) Sound.count();
       if (this.t <= 0) {
         this.state = 'play'; this.t = 30; Sound.go();
-        Sound.playBgmFrom(0);   // ゲーム開始のたびに曲を頭から鳴らす
         this.pop('スタート！！', '#7CFC00', false);
       }
     } else if (this.state === 'play') {
