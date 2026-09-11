@@ -63,6 +63,7 @@
   <button id="btnConnect">センサー接続</button>
   <button id="btnDebug" class="ghost">デバッグ</button>
   <button id="btnMute" class="ghost">音 ON</button>
+  <button id="btnClearRank" class="ghost">記録リセット</button>
   <button id="btnReset" class="ghost" onclick="G.reset()">タイトルに戻る</button>
 </div>
 
@@ -245,6 +246,13 @@ function showTopbar() {
 ['mousemove', 'mousedown', 'wheel', 'touchstart', 'keydown'].forEach(ev =>
   window.addEventListener(ev, showTopbar, { passive: true }));
 showTopbar();
+
+// ランキングの消去（開催日ごとにリセットする用）。誤操作防止に確認を挟む
+document.getElementById('btnClearRank').addEventListener('click', () => {
+  if (!confirm('本日のランキングをすべて消去します。よろしいですか？')) return;
+  localStorage.removeItem('fukumoku-ranking');
+  G.reset();   // reset内でloadTopが走り、表示も空になる
+});
 
 document.getElementById('btnMute').addEventListener('click', () => {
   Sound.init();
