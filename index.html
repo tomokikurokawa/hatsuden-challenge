@@ -222,7 +222,6 @@ window.addEventListener('keydown', e => {
   if (e.code === 'Space' || e.code === 'Enter') {
     e.preventDefault(); Sound.init();
     if (G.state === 'title') G.start();
-    else if (G.state === 'ready') G.beginCount();
   }
   if (e.key === 'd' || e.key === 'D') document.getElementById('debug').classList.toggle('show');
 });
@@ -824,7 +823,6 @@ const G = {
   // センサーは2回転ぶん回らないと値が出ない。その間を「漕ぎ出し待ち」にして、
   // 反応を確認してからカウントダウンに入ることで、スタート直後のラグを体感させない
   PEDAL_ON: 8,        // 漕ぎ出しと判定するrpm
-  READY_LIMIT: 15,    // これだけ待っても漕ぎ出さなければ自動でカウントダウンへ
   start() {
     this.state = 'ready'; this.t = 0;
     Sound.init(); Sound.stopGoalSfx();
@@ -938,8 +936,9 @@ const G = {
     if (this.state === 'ready') {
       this.t += dt;
       // 漕ぎ出しを検知したらカウントダウンへ。漕げない子のために時間切れでも進む
-      // 直前のプレイの惰性が残った状態で即スタートしないよう、最初の0.6秒は判定しない
-      if (this.t > 0.6 && (Input.rpm() >= this.PEDAL_ON || this.t >= this.READY_LIMIT)) this.beginCount();
+      // 直前のプレイの惰性が残った状態で即スタートしないよう、最初の0.6秒は判定しない。
+      // 漕ぎ出す以外に先へ進む手段は用意しない（時間切れでの自動スタートはしない）
+      if (this.t > 0.6 && Input.rpm() >= this.PEDAL_ON) this.beginCount();
     } else if (this.state === 'count') {
       const before = Math.ceil(this.t);
       this.t -= dt;
@@ -1190,9 +1189,6 @@ const G = {
       label('ペダルを こいでね！', 0, 0, 62, '#F0C400', 'center', true, '#3A2A10');
       ctx.restore();
       label('うごきだしたら カウントダウン', W / 2, H / 2 + 80, 30, '#fff', 'center', true, '#3A2A10');
-      if (this.t > 6) {
-        label('（タップ / スペースキーで すすめます）', W / 2, H / 2 + 140, 22, '#CFE3B8', 'center', true, '#1A3A10');
-      }
     } else if (this.state === 'count') {
       this.drawHud();
       ctx.fillStyle = 'rgba(0,0,0,.35)'; ctx.fillRect(0, 0, W, H);
@@ -1267,7 +1263,6 @@ cv.addEventListener('pointerdown', e => {
   const rect = cv.getBoundingClientRect();
   const x = (e.clientX - rect.left) * W / rect.width;
   const y = (e.clientY - rect.top) * H / rect.height;
-  if (G.state === 'ready') { G.beginCount(); return; }
   if (G.state === 'title') {
     const b = G.titleBtn;
     if (b && x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h) { G.start(); return; }
