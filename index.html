@@ -16,8 +16,13 @@
   }
   #topbar {
     display: flex; align-items: center; gap: 10px; padding: 6px 14px;
-    background: var(--forest); flex-wrap: wrap;
+    background: rgba(46, 84, 39, .94); flex-wrap: wrap;
+    position: fixed; top: 0; left: 0; right: 0; z-index: 40;
+    transition: opacity .25s ease, transform .25s ease;
   }
+  /* マウスを1秒動かさなければメニューとカーソルを隠す（来場者に見せる画面を広く保つ） */
+  body.idle #topbar { opacity: 0; transform: translateY(-100%); pointer-events: none; }
+  body.idle { cursor: none; }
   #topbar .title { font-weight: bold; font-size: 14px; margin-right: auto; }
   button {
     font-family: inherit; font-size: 13px; font-weight: bold; border: none;
@@ -217,6 +222,7 @@ window.addEventListener('keydown', e => {
   if (e.code === 'Space' || e.code === 'Enter') {
     e.preventDefault(); Sound.init();
     if (G.state === 'title') G.start();
+    else if (G.state === 'ready') G.beginCount();
   }
   if (e.key === 'd' || e.key === 'D') document.getElementById('debug').classList.toggle('show');
 });
@@ -230,6 +236,17 @@ document.getElementById('btnConnect').addEventListener('click', () => {
 });
 document.getElementById('btnDebug').addEventListener('click', () =>
   document.getElementById('debug').classList.toggle('show'));
+/* ================= 上部メニューの自動非表示 ================= */
+let __idleTimer = null;
+function showTopbar() {
+  document.body.classList.remove('idle');
+  clearTimeout(__idleTimer);
+  __idleTimer = setTimeout(() => document.body.classList.add('idle'), 1000);
+}
+['mousemove', 'mousedown', 'wheel', 'touchstart', 'keydown'].forEach(ev =>
+  window.addEventListener(ev, showTopbar, { passive: true }));
+showTopbar();
+
 document.getElementById('btnMute').addEventListener('click', () => {
   Sound.init();
   Sound.setMuted(!Sound.muted);
@@ -804,9 +821,17 @@ const G = {
     const list = JSON.parse(localStorage.getItem('fukumoku-ranking') || '[]');
     this.top = list.slice(0, 5);
   },
+  // センサーは2回転ぶん回らないと値が出ない。その間を「漕ぎ出し待ち」にして、
+  // 反応を確認してからカウントダウンに入ることで、スタート直後のラグを体感させない
+  PEDAL_ON: 8,        // 漕ぎ出しと判定するrpm
+  READY_LIMIT: 15,    // これだけ待っても漕ぎ出さなければ自動でカウントダウンへ
   start() {
-    this.state = 'count'; this.t = 3.4;
+    this.state = 'ready'; this.t = 0;
     Sound.init(); Sound.stopGoalSfx();
+  },
+  beginCount() {
+    if (this.state === 'count') return;
+    this.state = 'count'; this.t = 3.4;
     Sound.playBgmFrom(0);   // カウントダウン開始と同時に曲を頭から鳴らす
   },
   spawnConfetti(n) {
@@ -910,7 +935,12 @@ const G = {
       }
     }
 
-    if (this.state === 'count') {
+    if (this.state === 'ready') {
+      this.t += dt;
+      // 漕ぎ出しを検知したらカウントダウンへ。漕げない子のために時間切れでも進む
+      // 直前のプレイの惰性が残った状態で即スタートしないよう、最初の0.6秒は判定しない
+      if (this.t > 0.6 && (Input.rpm() >= this.PEDAL_ON || this.t >= this.READY_LIMIT)) this.beginCount();
+    } else if (this.state === 'count') {
       const before = Math.ceil(this.t);
       this.t -= dt;
       const after = Math.ceil(this.t);
@@ -958,7 +988,7 @@ const G = {
   stageInfo() {
     const n = Assets.stages.length;
     if (n <= 1) return { i: 0, j: 0, f: 0 };
-    if (this.state === 'title' || this.state === 'count') return { i: 0, j: 0, f: 0 };
+    if (this.state === 'title' || this.state === 'ready' || this.state === 'count') return { i: 0, j: 0, f: 0 };
     const elapsed = Math.min(30, Math.max(0, 30 - this.t));
     const per = 30 / n;
     const i = Math.min(n - 1, Math.floor(elapsed / per));
@@ -1078,7 +1108,7 @@ const G = {
       let frame = Assets.rider[frameIdx % Assets.rider.length] || Assets.rider[0];
       let wobble = 0;
       if (this.state === 'goal' && Assets.cheer) frame = Assets.cheer;
-      else if (this.state === 'count' && Input.rpm() < 15 && Assets.readyPose) frame = Assets.readyPose;
+      else if ((this.state === 'count' || this.state === 'ready') && Input.rpm() < 15 && Assets.readyPose) frame = Assets.readyPose;
       else if (this.state === 'play' && this.cheerT > 0 && Assets.cheer) frame = Assets.cheer;
       else if (this.state === 'play' && Input.watts() > 105 && Assets.sprintFrames.length) {
         frame = Assets.sprintFrames[frameIdx % Assets.sprintFrames.length];
@@ -1151,6 +1181,18 @@ const G = {
         label(`${i + 1} い`, W - 290, 278 + i * 36, 20, '#8A5A20', 'left');
         label(String(e.score), W - 90, 278 + i * 36, 22, '#33302A', 'right');
       });
+    } else if (this.state === 'ready') {
+      this.drawHud();   // メーターを出しておくと、漕いだ瞬間に針が動いて反応が伝わる
+      ctx.fillStyle = 'rgba(0,0,0,.35)'; ctx.fillRect(0, 0, W, H);
+      const pulse = 1 + Math.sin(performance.now() / 260) * 0.05;
+      ctx.save();
+      ctx.translate(W / 2, H / 2 - 20); ctx.scale(pulse, pulse);
+      label('ペダルを こいでね！', 0, 0, 62, '#F0C400', 'center', true, '#3A2A10');
+      ctx.restore();
+      label('うごきだしたら カウントダウン', W / 2, H / 2 + 80, 30, '#fff', 'center', true, '#3A2A10');
+      if (this.t > 6) {
+        label('（タップ / スペースキーで すすめます）', W / 2, H / 2 + 140, 22, '#CFE3B8', 'center', true, '#1A3A10');
+      }
     } else if (this.state === 'count') {
       this.drawHud();
       ctx.fillStyle = 'rgba(0,0,0,.35)'; ctx.fillRect(0, 0, W, H);
@@ -1225,6 +1267,7 @@ cv.addEventListener('pointerdown', e => {
   const rect = cv.getBoundingClientRect();
   const x = (e.clientX - rect.left) * W / rect.width;
   const y = (e.clientY - rect.top) * H / rect.height;
+  if (G.state === 'ready') { G.beginCount(); return; }
   if (G.state === 'title') {
     const b = G.titleBtn;
     if (b && x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h) { G.start(); return; }
