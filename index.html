@@ -1173,13 +1173,13 @@ const G = {
       label('スタート！', W / 2, b.y + 41, 34, '#fff', 'center');
       ctx.restore();
       this.titleBtn = b;
-      // ランキングボード
-      woodPanel(W - 330, 200, 290, 260);
-      label('本日のトップ5', W - 185, 236, 22, '#5A3A1A', 'center');
-      if (this.top.length === 0) label('まだ きろくが ないよ', W - 185, 330, 18, '#7A6244', 'center', false);
+      // ランキングボード（ロゴの下端が y=343 なので、かぶらないよう下げている）
+      woodPanel(W - 330, 372, 290, 260);
+      label('本日のトップ5', W - 185, 408, 22, '#5A3A1A', 'center');
+      if (this.top.length === 0) label('まだ きろくが ないよ', W - 185, 502, 18, '#7A6244', 'center', false);
       this.top.forEach((e, i) => {
-        label(`${i + 1} い`, W - 290, 278 + i * 36, 20, '#8A5A20', 'left');
-        label(String(e.score), W - 90, 278 + i * 36, 22, '#33302A', 'right');
+        label(`${i + 1} い`, W - 290, 450 + i * 36, 20, '#8A5A20', 'left');
+        label(String(e.score), W - 90, 450 + i * 36, 22, '#33302A', 'right');
       });
     } else if (this.state === 'ready') {
       this.drawHud();   // メーターを出しておくと、漕いだ瞬間に針が動いて反応が伝わる
